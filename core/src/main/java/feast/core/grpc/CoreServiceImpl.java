@@ -1,410 +1,488 @@
 /*
- * SPDX-License-Identifier: Apache-2.0
- * Copyright 2018-2019 The Feast Authors
+ * Copyright 2018 Confluent Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed under the Confluent Community License (the "License"); you may not use
+ * this file except in compliance with the License.  You may obtain a copy of the
+ * License at
  *
- *     https://www.apache.org/licenses/LICENSE-2.0
+ * http://www.confluent.io/confluent-community-license
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OF ANY KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations under the License.
  */
-package feast.core.grpc;
 
-import feast.common.auth.service.AuthorizationService;
-import feast.common.logging.interceptors.GrpcMessageInterceptor;
-import feast.core.config.FeastProperties;
-import feast.core.exception.RetrievalException;
-import feast.core.grpc.interceptors.MonitoringInterceptor;
-import feast.core.model.Project;
-import feast.core.service.ProjectService;
-import feast.core.service.SpecService;
-import feast.proto.core.CoreServiceGrpc.CoreServiceImplBase;
-import feast.proto.core.CoreServiceProto.*;
-import feast.proto.core.EntityProto.EntitySpecV2;
-import io.grpc.Status;
-import io.grpc.StatusRuntimeException;
-import io.grpc.stub.StreamObserver;
+package io.confluent.connect.jdbc.source;
+
+import java.util.TimeZone;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.utils.SystemTime;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.source.SourceRecord;
+import org.apache.kafka.connect.source.SourceTask;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
-import java.util.NoSuchElementException;
+import java.util.Locale;
+import java.util.Map;
+import java.util.PriorityQueue;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
 import java.util.stream.Collectors;
-import lombok.extern.slf4j.Slf4j;
-import net.devh.boot.grpc.server.service.GrpcService;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.security.access.AccessDeniedException;
-import org.springframework.security.core.context.SecurityContextHolder;
 
-/** Implementation of the feast core GRPC service. */
-@Slf4j
-@GrpcService(interceptors = {GrpcMessageInterceptor.class, MonitoringInterceptor.class})
-public class CoreServiceImpl extends CoreServiceImplBase {
+import io.confluent.connect.jdbc.dialect.DatabaseDialect;
+import io.confluent.connect.jdbc.dialect.DatabaseDialects;
+import io.confluent.connect.jdbc.util.CachedConnectionProvider;
+import io.confluent.connect.jdbc.util.ColumnDefinition;
+import io.confluent.connect.jdbc.util.ColumnId;
+import io.confluent.connect.jdbc.util.TableId;
+import io.confluent.connect.jdbc.util.Version;
 
-  private final FeastProperties feastProperties;
-  private SpecService specService;
-  private ProjectService projectService;
-  private final AuthorizationService authorizationService;
+/**
+ * JdbcSourceTask is a Kafka Connect SourceTask implementation that reads from JDBC databases and
+ * generates Kafka Connect records.
+ */
+public class JdbcSourceTask extends SourceTask {
+  // When no results, periodically return control flow to caller to give it a chance to pause us.
+  private static final int CONSECUTIVE_EMPTY_RESULTS_BEFORE_RETURN = 3;
 
-  @Autowired
-  public CoreServiceImpl(
-      SpecService specService,
-      ProjectService projectService,
-      FeastProperties feastProperties,
-      AuthorizationService authorizationService) {
-    this.specService = specService;
-    this.projectService = projectService;
-    this.feastProperties = feastProperties;
-    this.authorizationService = authorizationService;
+  private static final Logger log = LoggerFactory.getLogger(JdbcSourceTask.class);
+
+  private Time time;
+  private JdbcSourceTaskConfig config;
+  private DatabaseDialect dialect;
+  private CachedConnectionProvider cachedConnectionProvider;
+  private PriorityQueue<TableQuerier> tableQueue = new PriorityQueue<TableQuerier>();
+  private final AtomicBoolean running = new AtomicBoolean(false);
+
+  public JdbcSourceTask() {
+    this.time = new SystemTime();
+  }
+
+  public JdbcSourceTask(Time time) {
+    this.time = time;
   }
 
   @Override
-  public void getFeastCoreVersion(
-      GetFeastCoreVersionRequest request,
-      StreamObserver<GetFeastCoreVersionResponse> responseObserver) {
+  public String version() {
+    return Version.getVersion();
+  }
+
+  @Override
+  public void start(Map<String, String> properties) {
+    log.info("Starting JDBC source task");
     try {
-      GetFeastCoreVersionResponse response =
-          GetFeastCoreVersionResponse.newBuilder().setVersion(feastProperties.getVersion()).build();
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (RetrievalException | StatusRuntimeException e) {
-      log.error("Could not determine Feast Core version: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
+      config = new JdbcSourceTaskConfig(properties);
+    } catch (ConfigException e) {
+      throw new ConnectException("Couldn't start JdbcSourceTask due to configuration error", e);
+    }
+
+    final String url = config.getString(JdbcSourceConnectorConfig.CONNECTION_URL_CONFIG);
+    final int maxConnAttempts = config.getInt(JdbcSourceConnectorConfig.CONNECTION_ATTEMPTS_CONFIG);
+    final long retryBackoff = config.getLong(JdbcSourceConnectorConfig.CONNECTION_BACKOFF_CONFIG);
+
+    final String dialectName = config.getString(JdbcSourceConnectorConfig.DIALECT_NAME_CONFIG);
+    if (dialectName != null && !dialectName.trim().isEmpty()) {
+      dialect = DatabaseDialects.create(dialectName, config);
+    } else {
+      dialect = DatabaseDialects.findBestFor(url, config);
+    }
+    log.info("Using JDBC dialect {}", dialect.name());
+
+    cachedConnectionProvider = connectionProvider(maxConnAttempts, retryBackoff);
+
+    List<String> tables = config.getList(JdbcSourceTaskConfig.TABLES_CONFIG);
+    String query = config.getString(JdbcSourceTaskConfig.QUERY_CONFIG);
+    if ((tables.isEmpty() && query.isEmpty()) || (!tables.isEmpty() && !query.isEmpty())) {
+      throw new ConnectException("Invalid configuration: each JdbcSourceTask must have at "
+                                        + "least one table assigned to it or one query specified");
+    }
+    TableQuerier.QueryMode queryMode = !query.isEmpty() ? TableQuerier.QueryMode.QUERY :
+                                       TableQuerier.QueryMode.TABLE;
+    List<String> tablesOrQuery = queryMode == TableQuerier.QueryMode.QUERY
+                                 ? Collections.singletonList(query) : tables;
+
+    String mode = config.getString(JdbcSourceTaskConfig.MODE_CONFIG);
+    //used only in table mode
+    Map<String, List<Map<String, String>>> partitionsByTableFqn = new HashMap<>();
+    Map<Map<String, String>, Map<String, Object>> offsets = null;
+    if (mode.equals(JdbcSourceTaskConfig.MODE_INCREMENTING)
+        || mode.equals(JdbcSourceTaskConfig.MODE_TIMESTAMP)
+        || mode.equals(JdbcSourceTaskConfig.MODE_TIMESTAMP_INCREMENTING)) {
+      List<Map<String, String>> partitions = new ArrayList<>(tables.size());
+      switch (queryMode) {
+        case TABLE:
+          log.trace("Starting in TABLE mode");
+          for (String table : tables) {
+            // Find possible partition maps for different offset protocols
+            // We need to search by all offset protocol partition keys to support compatibility
+            List<Map<String, String>> tablePartitions = possibleTablePartitions(table);
+            partitions.addAll(tablePartitions);
+            partitionsByTableFqn.put(table, tablePartitions);
+          }
+          break;
+        case QUERY:
+          log.trace("Starting in QUERY mode");
+          partitions.add(Collections.singletonMap(JdbcSourceConnectorConstants.QUERY_NAME_KEY,
+                                                  JdbcSourceConnectorConstants.QUERY_NAME_VALUE));
+          break;
+        default:
+          throw new ConnectException("Unknown query mode: " + queryMode);
+      }
+      offsets = context.offsetStorageReader().offsets(partitions);
+      log.trace("The partition offsets are {}", offsets);
+    }
+
+    String incrementingColumn
+        = config.getString(JdbcSourceTaskConfig.INCREMENTING_COLUMN_NAME_CONFIG);
+    List<String> timestampColumns
+        = config.getList(JdbcSourceTaskConfig.TIMESTAMP_COLUMN_NAME_CONFIG);
+    Long timestampDelayInterval
+        = config.getLong(JdbcSourceTaskConfig.TIMESTAMP_DELAY_INTERVAL_MS_CONFIG);
+    boolean validateNonNulls
+        = config.getBoolean(JdbcSourceTaskConfig.VALIDATE_NON_NULL_CONFIG);
+    TimeZone timeZone = config.timeZone();
+    String suffix = config.getString(JdbcSourceTaskConfig.QUERY_SUFFIX_CONFIG).trim();
+
+    for (String tableOrQuery : tablesOrQuery) {
+      final List<Map<String, String>> tablePartitionsToCheck;
+      final Map<String, String> partition;
+      switch (queryMode) {
+        case TABLE:
+          if (validateNonNulls) {
+            validateNonNullable(
+                mode,
+                tableOrQuery,
+                incrementingColumn,
+                timestampColumns
+            );
+          }
+          tablePartitionsToCheck = partitionsByTableFqn.get(tableOrQuery);
+          break;
+        case QUERY:
+          partition = Collections.singletonMap(
+              JdbcSourceConnectorConstants.QUERY_NAME_KEY,
+              JdbcSourceConnectorConstants.QUERY_NAME_VALUE
+          );
+          tablePartitionsToCheck = Collections.singletonList(partition);
+          break;
+        default:
+          throw new ConnectException("Unexpected query mode: " + queryMode);
+      }
+
+      // The partition map varies by offset protocol. Since we don't know which protocol each
+      // table's offsets are keyed by, we need to use the different possible partitions
+      // (newest protocol version first) to find the actual offsets for each table.
+      Map<String, Object> offset = null;
+      if (offsets != null) {
+        for (Map<String, String> toCheckPartition : tablePartitionsToCheck) {
+          offset = offsets.get(toCheckPartition);
+          if (offset != null) {
+            log.info("Found offset {} for partition {}", offsets, toCheckPartition);
+            break;
+          }
+        }
+      }
+      offset = computeInitialOffset(tableOrQuery, offset, timeZone);
+
+      String topicPrefix = config.getString(JdbcSourceTaskConfig.TOPIC_PREFIX_CONFIG);
+
+      if (mode.equals(JdbcSourceTaskConfig.MODE_BULK)) {
+        tableQueue.add(
+            new BulkTableQuerier(
+                dialect, 
+                queryMode, 
+                tableOrQuery, 
+                topicPrefix, 
+                suffix
+            )
+        );
+      } else if (mode.equals(JdbcSourceTaskConfig.MODE_INCREMENTING)) {
+        tableQueue.add(
+            new TimestampIncrementingTableQuerier(
+                dialect,
+                queryMode,
+                tableOrQuery,
+                topicPrefix,
+                null,
+                incrementingColumn,
+                offset,
+                timestampDelayInterval,
+                timeZone,
+                suffix
+            )
+        );
+      } else if (mode.equals(JdbcSourceTaskConfig.MODE_TIMESTAMP)) {
+        tableQueue.add(
+            new TimestampIncrementingTableQuerier(
+                dialect,
+                queryMode,
+                tableOrQuery,
+                topicPrefix,
+                timestampColumns,
+                null,
+                offset,
+                timestampDelayInterval,
+                timeZone,
+                suffix
+            )
+        );
+      } else if (mode.endsWith(JdbcSourceTaskConfig.MODE_TIMESTAMP_INCREMENTING)) {
+        tableQueue.add(
+            new TimestampIncrementingTableQuerier(
+                dialect,
+                queryMode,
+                tableOrQuery,
+                topicPrefix,
+                timestampColumns,
+                incrementingColumn,
+                offset,
+                timestampDelayInterval,
+                timeZone,
+                suffix
+            )
+        );
+      }
+    }
+
+    running.set(true);
+    log.info("Started JDBC source task");
+  }
+
+  protected CachedConnectionProvider connectionProvider(int maxConnAttempts, long retryBackoff) {
+    return new CachedConnectionProvider(dialect, maxConnAttempts, retryBackoff) {
+      @Override
+      protected void onConnect(final Connection connection) throws SQLException {
+        super.onConnect(connection);
+        connection.setAutoCommit(false);
+      }
+    };
+  }
+
+  //This method returns a list of possible partition maps for different offset protocols
+  //This helps with the upgrades
+  private List<Map<String, String>> possibleTablePartitions(String table) {
+    TableId tableId = dialect.parseTableIdentifier(table);
+    return Arrays.asList(
+        OffsetProtocols.sourcePartitionForProtocolV1(tableId),
+        OffsetProtocols.sourcePartitionForProtocolV0(tableId)
+    );
+  }
+
+  protected Map<String, Object> computeInitialOffset(
+          String tableOrQuery,
+          Map<String, Object> partitionOffset,
+          TimeZone timezone) {
+    if (!(partitionOffset == null)) {
+      return partitionOffset;
+    } else {
+      Map<String, Object> initialPartitionOffset = null;
+      // no offsets found
+      Long timestampInitial = config.getLong(JdbcSourceConnectorConfig.TIMESTAMP_INITIAL_CONFIG);
+      if (timestampInitial != null) {
+        // start at the specified timestamp
+        if (timestampInitial == JdbcSourceConnectorConfig.TIMESTAMP_INITIAL_CURRENT) {
+          // use the current time
+          try {
+            final Connection con = cachedConnectionProvider.getConnection();
+            Calendar cal = Calendar.getInstance(timezone);
+            timestampInitial = dialect.currentTimeOnDB(con, cal).getTime();
+          } catch (SQLException e) {
+            throw new ConnectException("Error while getting initial timestamp from database", e);
+          }
+        }
+        initialPartitionOffset = new HashMap<String, Object>();
+        initialPartitionOffset.put(TimestampIncrementingOffset.TIMESTAMP_FIELD, timestampInitial);
+        log.info("No offsets found for '{}', so using configured timestamp {}", tableOrQuery,
+                timestampInitial);
+      }
+      return initialPartitionOffset;
     }
   }
 
   @Override
-  public void getEntity(
-      GetEntityRequest request, StreamObserver<GetEntityResponse> responseObserver) {
-    try {
-      GetEntityResponse response = specService.getEntity(request);
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (RetrievalException e) {
-      log.error("Unable to fetch entity requested in GetEntity method: ", e);
-      responseObserver.onError(
-          Status.NOT_FOUND.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (IllegalArgumentException e) {
-      log.error("Illegal arguments provided to GetEntity method: ", e);
-      responseObserver.onError(
-          Status.INVALID_ARGUMENT
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (Exception e) {
-      log.error("Exception has occurred in GetEntity method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    }
+  public void stop() throws ConnectException {
+    log.info("Stopping JDBC source task");
+    running.set(false);
+    // All resources are closed at the end of 'poll()' when no longer running or
+    // if there is an error
   }
 
-  /** Retrieve a list of features */
-  @Override
-  public void listFeatures(
-      ListFeaturesRequest request, StreamObserver<ListFeaturesResponse> responseObserver) {
+  protected void closeResources() {
+    log.info("Closing resources for JDBC source task");
     try {
-      ListFeaturesResponse response = specService.listFeatures(request.getFilter());
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (IllegalArgumentException e) {
-      log.error("Illegal arguments provided to ListFeatures method: ", e);
-      responseObserver.onError(
-          Status.INVALID_ARGUMENT
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (RetrievalException e) {
-      log.error("Unable to fetch entities requested in ListFeatures method: ", e);
-      responseObserver.onError(
-          Status.NOT_FOUND.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (Exception e) {
-      log.error("Exception has occurred in ListFeatures method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    }
-  }
-
-  /** Retrieve a list of entities */
-  @Override
-  public void listEntities(
-      ListEntitiesRequest request, StreamObserver<ListEntitiesResponse> responseObserver) {
-    try {
-      ListEntitiesResponse response = specService.listEntities(request.getFilter());
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (IllegalArgumentException e) {
-      log.error("Illegal arguments provided to ListEntities method: ", e);
-      responseObserver.onError(
-          Status.INVALID_ARGUMENT
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (RetrievalException e) {
-      log.error("Unable to fetch entities requested in ListEntities method: ", e);
-      responseObserver.onError(
-          Status.NOT_FOUND.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (Exception e) {
-      log.error("Exception has occurred in ListEntities method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
+      if (cachedConnectionProvider != null) {
+        cachedConnectionProvider.close();
+      }
+    } catch (Throwable t) {
+      log.warn("Error while closing the connections", t);
+    } finally {
+      cachedConnectionProvider = null;
+      try {
+        if (dialect != null) {
+          dialect.close();
+        }
+      } catch (Throwable t) {
+        log.warn("Error while closing the {} dialect: ", dialect.name(), t);
+      } finally {
+        dialect = null;
+      }
     }
   }
 
   @Override
-  public void listStores(
-      ListStoresRequest request, StreamObserver<ListStoresResponse> responseObserver) {
-    try {
-      ListStoresResponse response = specService.listStores(request.getFilter());
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (RetrievalException e) {
-      log.error("Exception has occurred in ListStores method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
+  public List<SourceRecord> poll() throws InterruptedException {
+    log.trace("{} Polling for new data");
+
+    Map<TableQuerier, Integer> consecutiveEmptyResults = tableQueue.stream().collect(
+        Collectors.toMap(Function.identity(), (q) -> 0));
+    while (running.get()) {
+      final TableQuerier querier = tableQueue.peek();
+
+      if (!querier.querying()) {
+        // If not in the middle of an update, wait for next update time
+        final long nextUpdate = querier.getLastUpdate()
+            + config.getInt(JdbcSourceTaskConfig.POLL_INTERVAL_MS_CONFIG);
+        final long now = time.milliseconds();
+        final long sleepMs = Math.min(nextUpdate - now, 100);
+
+        if (sleepMs > 0) {
+          log.trace("Waiting {} ms to poll {} next", nextUpdate - now, querier.toString());
+          time.sleep(sleepMs);
+          continue; // Re-check stop flag before continuing
+        }
+      }
+
+      final List<SourceRecord> results = new ArrayList<>();
+      try {
+        log.debug("Checking for next block of results from {}", querier.toString());
+        querier.maybeStartQuery(cachedConnectionProvider.getConnection());
+
+        int batchMaxRows = config.getInt(JdbcSourceTaskConfig.BATCH_MAX_ROWS_CONFIG);
+        boolean hadNext = true;
+        while (results.size() < batchMaxRows && (hadNext = querier.next())) {
+          results.add(querier.extractRecord());
+        }
+
+        if (!hadNext) {
+          // If we finished processing the results from the current query, we can reset and send
+          // the querier to the tail of the queue
+          resetAndRequeueHead(querier);
+        }
+
+        if (results.isEmpty()) {
+          consecutiveEmptyResults.compute(querier, (k, v) -> v + 1);
+          log.trace("No updates for {}", querier.toString());
+
+          if (Collections.min(consecutiveEmptyResults.values())
+              >= CONSECUTIVE_EMPTY_RESULTS_BEFORE_RETURN) {
+            log.trace("More than " + CONSECUTIVE_EMPTY_RESULTS_BEFORE_RETURN
+                + " consecutive empty results for all queriers, returning");
+            return null;
+          } else {
+            continue;
+          }
+        } else {
+          consecutiveEmptyResults.put(querier, 0);
+        }
+
+        log.debug("Returning {} records for {}", results.size(), querier.toString());
+        return results;
+      } catch (SQLException sqle) {
+        log.error("Failed to run query for table {}: {}", querier.toString(), sqle);
+        resetAndRequeueHead(querier);
+        return null;
+      } catch (Throwable t) {
+        resetAndRequeueHead(querier);
+        // This task has failed, so close any resources (may be reopened if needed) before throwing
+        closeResources();
+        throw t;
+      }
     }
+
+    // Only in case of shutdown
+    final TableQuerier querier = tableQueue.peek();
+    if (querier != null) {
+      resetAndRequeueHead(querier);
+    }
+    closeResources();
+    return null;
   }
 
-  /* Registers an entity to Feast Core */
-  @Override
-  public void applyEntity(
-      ApplyEntityRequest request, StreamObserver<ApplyEntityResponse> responseObserver) {
-
-    String projectId = null;
-
-    try {
-      EntitySpecV2 spec = request.getSpec();
-      projectId = request.getProject();
-      authorizationService.authorizeRequest(SecurityContextHolder.getContext(), projectId);
-      ApplyEntityResponse response = specService.applyEntity(spec, projectId);
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (org.hibernate.exception.ConstraintViolationException e) {
-      log.error(
-          "Unable to persist this entity due to a constraint violation. Please ensure that"
-              + " field names are unique within the project namespace: ",
-          e);
-      responseObserver.onError(
-          Status.ALREADY_EXISTS.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (AccessDeniedException e) {
-      log.info(String.format("User prevented from accessing project: %s", projectId));
-      responseObserver.onError(
-          Status.PERMISSION_DENIED
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (Exception e) {
-      log.error("Exception has occurred in ApplyEntity method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    }
+  private void resetAndRequeueHead(TableQuerier expectedHead) {
+    log.debug("Resetting querier {}", expectedHead.toString());
+    TableQuerier removedQuerier = tableQueue.poll();
+    assert removedQuerier == expectedHead;
+    expectedHead.reset(time.milliseconds());
+    tableQueue.add(expectedHead);
   }
 
-  @Override
-  public void updateStore(
-      UpdateStoreRequest request, StreamObserver<UpdateStoreResponse> responseObserver) {
+  private void validateNonNullable(
+      String incrementalMode,
+      String table,
+      String incrementingColumn,
+      List<String> timestampColumns
+  ) {
     try {
-      UpdateStoreResponse response = specService.updateStore(request);
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (Exception e) {
-      log.error("Exception has occurred in UpdateStore method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    }
-  }
+      Set<String> lowercaseTsColumns = new HashSet<>();
+      for (String timestampColumn: timestampColumns) {
+        lowercaseTsColumns.add(timestampColumn.toLowerCase(Locale.getDefault()));
+      }
 
-  @Override
-  public void createProject(
-      CreateProjectRequest request, StreamObserver<CreateProjectResponse> responseObserver) {
-    try {
-      projectService.createProject(request.getName());
-      responseObserver.onNext(CreateProjectResponse.getDefaultInstance());
-      responseObserver.onCompleted();
-    } catch (Exception e) {
-      log.error("Exception has occurred in the createProject method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    }
-  }
+      boolean incrementingOptional = false;
+      boolean atLeastOneTimestampNotOptional = false;
+      final Connection conn = cachedConnectionProvider.getConnection();
+      boolean autoCommit = conn.getAutoCommit();
+      try {
+        conn.setAutoCommit(true);
+        Map<ColumnId, ColumnDefinition> defnsById = dialect.describeColumns(conn, table, null);
+        for (ColumnDefinition defn : defnsById.values()) {
+          String columnName = defn.id().name();
+          if (columnName.equalsIgnoreCase(incrementingColumn)) {
+            incrementingOptional = defn.isOptional();
+          } else if (lowercaseTsColumns.contains(columnName.toLowerCase(Locale.getDefault()))) {
+            if (!defn.isOptional()) {
+              atLeastOneTimestampNotOptional = true;
+            }
+          }
+        }
+      } finally {
+        conn.setAutoCommit(autoCommit);
+      }
 
-  @Override
-  public void archiveProject(
-      ArchiveProjectRequest request, StreamObserver<ArchiveProjectResponse> responseObserver) {
-    String projectId = null;
-    try {
-      projectId = request.getName();
-      authorizationService.authorizeRequest(SecurityContextHolder.getContext(), projectId);
-      projectService.archiveProject(projectId);
-      responseObserver.onNext(ArchiveProjectResponse.getDefaultInstance());
-      responseObserver.onCompleted();
-    } catch (IllegalArgumentException e) {
-      log.error("Recieved an invalid request on calling archiveProject method:", e);
-      responseObserver.onError(
-          Status.INVALID_ARGUMENT
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (UnsupportedOperationException e) {
-      log.error("Attempted to archive an unsupported project:", e);
-      responseObserver.onError(
-          Status.UNIMPLEMENTED.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (AccessDeniedException e) {
-      log.info(String.format("User prevented from accessing project: %s", projectId));
-      responseObserver.onError(
-          Status.PERMISSION_DENIED
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (Exception e) {
-      log.error("Exception has occurred in the createProject method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    }
-  }
-
-  @Override
-  public void listProjects(
-      ListProjectsRequest request, StreamObserver<ListProjectsResponse> responseObserver) {
-    try {
-      List<Project> projects = projectService.listProjects();
-      responseObserver.onNext(
-          ListProjectsResponse.newBuilder()
-              .addAllProjects(projects.stream().map(Project::getName).collect(Collectors.toList()))
-              .build());
-      responseObserver.onCompleted();
-    } catch (Exception e) {
-      log.error("Exception has occurred in the listProjects method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    }
-  }
-
-  @Override
-  public void applyFeatureTable(
-      ApplyFeatureTableRequest request,
-      StreamObserver<ApplyFeatureTableResponse> responseObserver) {
-    String projectName = SpecService.resolveProjectName(request.getProject());
-    String tableName = request.getTableSpec().getName();
-
-    try {
-      // Check if user has authorization to apply feature table
-      authorizationService.authorizeRequest(SecurityContextHolder.getContext(), projectName);
-
-      ApplyFeatureTableResponse response = specService.applyFeatureTable(request);
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (AccessDeniedException e) {
-      log.info(
-          String.format(
-              "ApplyFeatureTable: Not authorized to access project to apply: %s", projectName));
-      responseObserver.onError(
-          Status.PERMISSION_DENIED
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (org.hibernate.exception.ConstraintViolationException e) {
-      log.error(
-          String.format(
-              "ApplyFeatureTable: Unable to apply Feature Table due to a conflict: "
-                  + "Ensure that name is unique within Project: (name: %s, project: %s)",
-              projectName, tableName));
-      responseObserver.onError(
-          Status.ALREADY_EXISTS.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (IllegalArgumentException e) {
-      log.error(
-          String.format(
-              "ApplyFeatureTable: Invalid apply Feature Table Request: (name: %s, project: %s)",
-              projectName, tableName));
-      responseObserver.onError(
-          Status.INVALID_ARGUMENT
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (UnsupportedOperationException e) {
-      log.error(
-          String.format(
-              "ApplyFeatureTable: Unsupported apply Feature Table Request: (name: %s, project: %s)",
-              projectName, tableName));
-      responseObserver.onError(
-          Status.UNIMPLEMENTED.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (Exception e) {
-      log.error("ApplyFeatureTable Exception has occurred:", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    }
-  }
-
-  @Override
-  public void listFeatureTables(
-      ListFeatureTablesRequest request,
-      StreamObserver<ListFeatureTablesResponse> responseObserver) {
-    try {
-      ListFeatureTablesResponse response = specService.listFeatureTables(request.getFilter());
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (IllegalArgumentException e) {
-      log.error(String.format("ListFeatureTable: Invalid list Feature Table Request"));
-      responseObserver.onError(
-          Status.INVALID_ARGUMENT
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (Exception e) {
-      log.error("ListFeatureTable: Exception has occurred: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    }
-  }
-
-  @Override
-  public void getFeatureTable(
-      GetFeatureTableRequest request, StreamObserver<GetFeatureTableResponse> responseObserver) {
-    try {
-      GetFeatureTableResponse response = specService.getFeatureTable(request);
-
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (NoSuchElementException e) {
-      log.error(
-          String.format(
-              "GetFeatureTable: No such Feature Table: (project: %s, name: %s)",
-              request.getProject(), request.getName()));
-      responseObserver.onError(
-          Status.NOT_FOUND.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (Exception e) {
-      log.error("GetFeatureTable: Exception has occurred: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    }
-  }
-
-  @Override
-  public void deleteFeatureTable(
-      DeleteFeatureTableRequest request,
-      StreamObserver<DeleteFeatureTableResponse> responseObserver) {
-    String projectName = request.getProject();
-    try {
-      // Check if user has authorization to delete feature table
-      authorizationService.authorizeRequest(SecurityContextHolder.getContext(), projectName);
-      specService.deleteFeatureTable(request);
-
-      responseObserver.onNext(DeleteFeatureTableResponse.getDefaultInstance());
-      responseObserver.onCompleted();
-    } catch (NoSuchElementException e) {
-      log.error(
-          String.format(
-              "DeleteFeatureTable: No such Feature Table: (project: %s, name: %s)",
-              request.getProject(), request.getName()));
-      responseObserver.onError(
-          Status.NOT_FOUND.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (Exception e) {
-      log.error("DeleteFeatureTable: Exception has occurred: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
+      // Validate that requested columns for offsets are NOT NULL. Currently this is only performed
+      // for table-based copying because custom query mode doesn't allow this to be looked up
+      // without a query or parsing the query since we don't have a table name.
+      if ((incrementalMode.equals(JdbcSourceConnectorConfig.MODE_INCREMENTING)
+           || incrementalMode.equals(JdbcSourceConnectorConfig.MODE_TIMESTAMP_INCREMENTING))
+          && incrementingOptional) {
+        throw new ConnectException("Cannot make incremental queries using incrementing column "
+                                   + incrementingColumn + " on " + table + " because this column "
+                                   + "is nullable.");
+      }
+      if ((incrementalMode.equals(JdbcSourceConnectorConfig.MODE_TIMESTAMP)
+           || incrementalMode.equals(JdbcSourceConnectorConfig.MODE_TIMESTAMP_INCREMENTING))
+          && !atLeastOneTimestampNotOptional) {
+        throw new ConnectException("Cannot make incremental queries using timestamp columns "
+                                   + timestampColumns + " on " + table + " because all of these "
+                                   + "columns "
+                                   + "nullable.");
+      }
+    } catch (SQLException e) {
+      throw new ConnectException("Failed trying to validate that columns used for offsets are NOT"
+                                 + " NULL", e);
     }
   }
 }
