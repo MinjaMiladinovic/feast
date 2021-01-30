@@ -1,410 +1,342 @@
 /*
- * SPDX-License-Identifier: Apache-2.0
- * Copyright 2018-2019 The Feast Authors
+ * Copyright 2018 Confluent Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed under the Confluent Community License (the "License"); you may not use
+ * this file except in compliance with the License.  You may obtain a copy of the
+ * License at
  *
- *     https://www.apache.org/licenses/LICENSE-2.0
+ * http://www.confluent.io/confluent-community-license
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OF ANY KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations under the License.
  */
-package feast.core.grpc;
 
-import feast.common.auth.service.AuthorizationService;
-import feast.common.logging.interceptors.GrpcMessageInterceptor;
-import feast.core.config.FeastProperties;
-import feast.core.exception.RetrievalException;
-import feast.core.grpc.interceptors.MonitoringInterceptor;
-import feast.core.model.Project;
-import feast.core.service.ProjectService;
-import feast.core.service.SpecService;
-import feast.proto.core.CoreServiceGrpc.CoreServiceImplBase;
-import feast.proto.core.CoreServiceProto.*;
-import feast.proto.core.EntityProto.EntitySpecV2;
-import io.grpc.Status;
-import io.grpc.StatusRuntimeException;
-import io.grpc.stub.StreamObserver;
+package io.confluent.connect.jdbc.sink;
+
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.sink.SinkRecord;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
-import java.util.NoSuchElementException;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.stream.Collectors;
-import lombok.extern.slf4j.Slf4j;
-import net.devh.boot.grpc.server.service.GrpcService;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.security.access.AccessDeniedException;
-import org.springframework.security.core.context.SecurityContextHolder;
 
-/** Implementation of the feast core GRPC service. */
-@Slf4j
-@GrpcService(interceptors = {GrpcMessageInterceptor.class, MonitoringInterceptor.class})
-public class CoreServiceImpl extends CoreServiceImplBase {
+import io.confluent.connect.jdbc.dialect.DatabaseDialect;
+import io.confluent.connect.jdbc.dialect.DatabaseDialect.StatementBinder;
+import io.confluent.connect.jdbc.sink.metadata.FieldsMetadata;
+import io.confluent.connect.jdbc.sink.metadata.SchemaPair;
+import io.confluent.connect.jdbc.util.ColumnId;
+import io.confluent.connect.jdbc.util.TableId;
 
-  private final FeastProperties feastProperties;
-  private SpecService specService;
-  private ProjectService projectService;
-  private final AuthorizationService authorizationService;
+import static io.confluent.connect.jdbc.sink.JdbcSinkConfig.InsertMode.INSERT;
+import static java.util.Objects.isNull;
+import static java.util.Objects.nonNull;
 
-  @Autowired
-  public CoreServiceImpl(
-      SpecService specService,
-      ProjectService projectService,
-      FeastProperties feastProperties,
-      AuthorizationService authorizationService) {
-    this.specService = specService;
-    this.projectService = projectService;
-    this.feastProperties = feastProperties;
-    this.authorizationService = authorizationService;
+public class BufferedRecords {
+  private static final Logger log = LoggerFactory.getLogger(BufferedRecords.class);
+
+  private final TableId tableId;
+  private final JdbcSinkConfig config;
+  private final DatabaseDialect dbDialect;
+  private final DbStructure dbStructure;
+  private final Connection connection;
+
+  private List<SinkRecord> records = new ArrayList<>();
+  private Schema keySchema;
+  private Schema valueSchema;
+  private RecordValidator recordValidator;
+  private FieldsMetadata fieldsMetadata;
+  private PreparedStatement updatePreparedStatement;
+  private PreparedStatement deletePreparedStatement;
+  private StatementBinder updateStatementBinder;
+  private StatementBinder deleteStatementBinder;
+  private boolean deletesInBatch = false;
+
+  public BufferedRecords(
+      JdbcSinkConfig config,
+      TableId tableId,
+      DatabaseDialect dbDialect,
+      DbStructure dbStructure,
+      Connection connection
+  ) {
+    this.tableId = tableId;
+    this.config = config;
+    this.dbDialect = dbDialect;
+    this.dbStructure = dbStructure;
+    this.connection = connection;
+    this.recordValidator = RecordValidator.create(config);
   }
 
-  @Override
-  public void getFeastCoreVersion(
-      GetFeastCoreVersionRequest request,
-      StreamObserver<GetFeastCoreVersionResponse> responseObserver) {
-    try {
-      GetFeastCoreVersionResponse response =
-          GetFeastCoreVersionResponse.newBuilder().setVersion(feastProperties.getVersion()).build();
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (RetrievalException | StatusRuntimeException e) {
-      log.error("Could not determine Feast Core version: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
+  public List<SinkRecord> add(SinkRecord record) throws SQLException {
+    recordValidator.validate(record);
+    final List<SinkRecord> flushed = new ArrayList<>();
+
+    boolean schemaChanged = false;
+    if (!Objects.equals(keySchema, record.keySchema())) {
+      keySchema = record.keySchema();
+      schemaChanged = true;
     }
-  }
-
-  @Override
-  public void getEntity(
-      GetEntityRequest request, StreamObserver<GetEntityResponse> responseObserver) {
-    try {
-      GetEntityResponse response = specService.getEntity(request);
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (RetrievalException e) {
-      log.error("Unable to fetch entity requested in GetEntity method: ", e);
-      responseObserver.onError(
-          Status.NOT_FOUND.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (IllegalArgumentException e) {
-      log.error("Illegal arguments provided to GetEntity method: ", e);
-      responseObserver.onError(
-          Status.INVALID_ARGUMENT
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (Exception e) {
-      log.error("Exception has occurred in GetEntity method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
+    if (isNull(record.valueSchema())) {
+      // For deletes, value and optionally value schema come in as null.
+      // We don't want to treat this as a schema change if key schemas is the same
+      // otherwise we flush unnecessarily.
+      if (config.deleteEnabled) {
+        deletesInBatch = true;
+      }
+    } else if (Objects.equals(valueSchema, record.valueSchema())) {
+      if (config.deleteEnabled && deletesInBatch) {
+        // flush so an insert after a delete of same record isn't lost
+        flushed.addAll(flush());
+      }
+    } else {
+      // value schema is not null and has changed. This is a real schema change.
+      valueSchema = record.valueSchema();
+      schemaChanged = true;
     }
-  }
+    if (schemaChanged || updateStatementBinder == null) {
+      // Each batch needs to have the same schemas, so get the buffered records out
+      flushed.addAll(flush());
 
-  /** Retrieve a list of features */
-  @Override
-  public void listFeatures(
-      ListFeaturesRequest request, StreamObserver<ListFeaturesResponse> responseObserver) {
-    try {
-      ListFeaturesResponse response = specService.listFeatures(request.getFilter());
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (IllegalArgumentException e) {
-      log.error("Illegal arguments provided to ListFeatures method: ", e);
-      responseObserver.onError(
-          Status.INVALID_ARGUMENT
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (RetrievalException e) {
-      log.error("Unable to fetch entities requested in ListFeatures method: ", e);
-      responseObserver.onError(
-          Status.NOT_FOUND.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (Exception e) {
-      log.error("Exception has occurred in ListFeatures method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
+      // re-initialize everything that depends on the record schema
+      final SchemaPair schemaPair = new SchemaPair(
+          record.keySchema(),
+          record.valueSchema()
+      );
+      fieldsMetadata = FieldsMetadata.extract(
+          tableId.tableName(),
+          config.pkMode,
+          config.pkFields,
+          config.fieldsWhitelist,
+          schemaPair
+      );
+      dbStructure.createOrAmendIfNecessary(
+          config,
+          connection,
+          tableId,
+          fieldsMetadata
+      );
+      final String insertSql = getInsertSql();
+      final String deleteSql = getDeleteSql();
+      log.debug(
+          "{} sql: {} deleteSql: {} meta: {}",
+          config.insertMode,
+          insertSql,
+          deleteSql,
+          fieldsMetadata
+      );
+      close();
+      updatePreparedStatement = dbDialect.createPreparedStatement(connection, insertSql);
+      updateStatementBinder = dbDialect.statementBinder(
+          updatePreparedStatement,
+          config.pkMode,
+          schemaPair,
+          fieldsMetadata,
+          config.insertMode
+      );
+      if (config.deleteEnabled && nonNull(deleteSql)) {
+        deletePreparedStatement = dbDialect.createPreparedStatement(connection, deleteSql);
+        deleteStatementBinder = dbDialect.statementBinder(
+            deletePreparedStatement,
+            config.pkMode,
+            schemaPair,
+            fieldsMetadata,
+            config.insertMode
+        );
+      }
     }
-  }
-
-  /** Retrieve a list of entities */
-  @Override
-  public void listEntities(
-      ListEntitiesRequest request, StreamObserver<ListEntitiesResponse> responseObserver) {
-    try {
-      ListEntitiesResponse response = specService.listEntities(request.getFilter());
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (IllegalArgumentException e) {
-      log.error("Illegal arguments provided to ListEntities method: ", e);
-      responseObserver.onError(
-          Status.INVALID_ARGUMENT
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (RetrievalException e) {
-      log.error("Unable to fetch entities requested in ListEntities method: ", e);
-      responseObserver.onError(
-          Status.NOT_FOUND.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (Exception e) {
-      log.error("Exception has occurred in ListEntities method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
+    
+    // set deletesInBatch if schema value is not null
+    if (isNull(record.value()) && config.deleteEnabled) {
+      deletesInBatch = true;
     }
-  }
 
-  @Override
-  public void listStores(
-      ListStoresRequest request, StreamObserver<ListStoresResponse> responseObserver) {
-    try {
-      ListStoresResponse response = specService.listStores(request.getFilter());
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (RetrievalException e) {
-      log.error("Exception has occurred in ListStores method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
+    records.add(record);
+
+    if (records.size() >= config.batchSize) {
+      flushed.addAll(flush());
     }
+    return flushed;
   }
 
-  /* Registers an entity to Feast Core */
-  @Override
-  public void applyEntity(
-      ApplyEntityRequest request, StreamObserver<ApplyEntityResponse> responseObserver) {
-
-    String projectId = null;
-
-    try {
-      EntitySpecV2 spec = request.getSpec();
-      projectId = request.getProject();
-      authorizationService.authorizeRequest(SecurityContextHolder.getContext(), projectId);
-      ApplyEntityResponse response = specService.applyEntity(spec, projectId);
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (org.hibernate.exception.ConstraintViolationException e) {
-      log.error(
-          "Unable to persist this entity due to a constraint violation. Please ensure that"
-              + " field names are unique within the project namespace: ",
-          e);
-      responseObserver.onError(
-          Status.ALREADY_EXISTS.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (AccessDeniedException e) {
-      log.info(String.format("User prevented from accessing project: %s", projectId));
-      responseObserver.onError(
-          Status.PERMISSION_DENIED
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (Exception e) {
-      log.error("Exception has occurred in ApplyEntity method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
+  public List<SinkRecord> flush() throws SQLException {
+    if (records.isEmpty()) {
+      log.debug("Records is empty");
+      return new ArrayList<>();
     }
-  }
-
-  @Override
-  public void updateStore(
-      UpdateStoreRequest request, StreamObserver<UpdateStoreResponse> responseObserver) {
-    try {
-      UpdateStoreResponse response = specService.updateStore(request);
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (Exception e) {
-      log.error("Exception has occurred in UpdateStore method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
+    log.debug("Flushing {} buffered records", records.size());
+    for (SinkRecord record : records) {
+      if (isNull(record.value()) && nonNull(deleteStatementBinder)) {
+        deleteStatementBinder.bindRecord(record);
+      } else {
+        updateStatementBinder.bindRecord(record);
+      }
     }
-  }
+    Optional<Long> totalUpdateCount = executeUpdates();
+    long totalDeleteCount = executeDeletes();
 
-  @Override
-  public void createProject(
-      CreateProjectRequest request, StreamObserver<CreateProjectResponse> responseObserver) {
-    try {
-      projectService.createProject(request.getName());
-      responseObserver.onNext(CreateProjectResponse.getDefaultInstance());
-      responseObserver.onCompleted();
-    } catch (Exception e) {
-      log.error("Exception has occurred in the createProject method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
+    final long expectedCount = updateRecordCount();
+    log.trace("{} records:{} resulting in totalUpdateCount:{} totalDeleteCount:{}",
+        config.insertMode, records.size(), totalUpdateCount, totalDeleteCount
+    );
+    if (totalUpdateCount.filter(total -> total != expectedCount).isPresent()
+        && config.insertMode == INSERT) {
+      throw new ConnectException(String.format(
+          "Update count (%d) did not sum up to total number of records inserted (%d)",
+          totalUpdateCount.get(),
+          expectedCount
+      ));
     }
-  }
-
-  @Override
-  public void archiveProject(
-      ArchiveProjectRequest request, StreamObserver<ArchiveProjectResponse> responseObserver) {
-    String projectId = null;
-    try {
-      projectId = request.getName();
-      authorizationService.authorizeRequest(SecurityContextHolder.getContext(), projectId);
-      projectService.archiveProject(projectId);
-      responseObserver.onNext(ArchiveProjectResponse.getDefaultInstance());
-      responseObserver.onCompleted();
-    } catch (IllegalArgumentException e) {
-      log.error("Recieved an invalid request on calling archiveProject method:", e);
-      responseObserver.onError(
-          Status.INVALID_ARGUMENT
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (UnsupportedOperationException e) {
-      log.error("Attempted to archive an unsupported project:", e);
-      responseObserver.onError(
-          Status.UNIMPLEMENTED.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (AccessDeniedException e) {
-      log.info(String.format("User prevented from accessing project: %s", projectId));
-      responseObserver.onError(
-          Status.PERMISSION_DENIED
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (Exception e) {
-      log.error("Exception has occurred in the createProject method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    }
-  }
-
-  @Override
-  public void listProjects(
-      ListProjectsRequest request, StreamObserver<ListProjectsResponse> responseObserver) {
-    try {
-      List<Project> projects = projectService.listProjects();
-      responseObserver.onNext(
-          ListProjectsResponse.newBuilder()
-              .addAllProjects(projects.stream().map(Project::getName).collect(Collectors.toList()))
-              .build());
-      responseObserver.onCompleted();
-    } catch (Exception e) {
-      log.error("Exception has occurred in the listProjects method: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    }
-  }
-
-  @Override
-  public void applyFeatureTable(
-      ApplyFeatureTableRequest request,
-      StreamObserver<ApplyFeatureTableResponse> responseObserver) {
-    String projectName = SpecService.resolveProjectName(request.getProject());
-    String tableName = request.getTableSpec().getName();
-
-    try {
-      // Check if user has authorization to apply feature table
-      authorizationService.authorizeRequest(SecurityContextHolder.getContext(), projectName);
-
-      ApplyFeatureTableResponse response = specService.applyFeatureTable(request);
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (AccessDeniedException e) {
+    if (!totalUpdateCount.isPresent()) {
       log.info(
-          String.format(
-              "ApplyFeatureTable: Not authorized to access project to apply: %s", projectName));
-      responseObserver.onError(
-          Status.PERMISSION_DENIED
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (org.hibernate.exception.ConstraintViolationException e) {
-      log.error(
-          String.format(
-              "ApplyFeatureTable: Unable to apply Feature Table due to a conflict: "
-                  + "Ensure that name is unique within Project: (name: %s, project: %s)",
-              projectName, tableName));
-      responseObserver.onError(
-          Status.ALREADY_EXISTS.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (IllegalArgumentException e) {
-      log.error(
-          String.format(
-              "ApplyFeatureTable: Invalid apply Feature Table Request: (name: %s, project: %s)",
-              projectName, tableName));
-      responseObserver.onError(
-          Status.INVALID_ARGUMENT
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (UnsupportedOperationException e) {
-      log.error(
-          String.format(
-              "ApplyFeatureTable: Unsupported apply Feature Table Request: (name: %s, project: %s)",
-              projectName, tableName));
-      responseObserver.onError(
-          Status.UNIMPLEMENTED.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (Exception e) {
-      log.error("ApplyFeatureTable Exception has occurred:", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
+          "{} records:{} , but no count of the number of rows it affected is available",
+          config.insertMode,
+          records.size()
+      );
+    }
+
+    final List<SinkRecord> flushedRecords = records;
+    records = new ArrayList<>();
+    deletesInBatch = false;
+    return flushedRecords;
+  }
+
+  /**
+   * @return an optional count of all updated rows or an empty optional if no info is available
+   */
+  private Optional<Long> executeUpdates() throws SQLException {
+    Optional<Long> count = Optional.empty();
+    for (int updateCount : updatePreparedStatement.executeBatch()) {
+      if (updateCount != Statement.SUCCESS_NO_INFO) {
+        count = count.isPresent()
+            ? count.map(total -> total + updateCount)
+            : Optional.of((long) updateCount);
+      }
+    }
+    return count;
+  }
+
+  private long executeDeletes() throws SQLException {
+    long totalDeleteCount = 0;
+    if (nonNull(deletePreparedStatement)) {
+      for (int updateCount : deletePreparedStatement.executeBatch()) {
+        if (updateCount != Statement.SUCCESS_NO_INFO) {
+          totalDeleteCount += updateCount;
+        }
+      }
+    }
+    return totalDeleteCount;
+  }
+
+  private long updateRecordCount() {
+    return records
+        .stream()
+        // ignore deletes
+        .filter(record -> nonNull(record.value()) || !config.deleteEnabled)
+        .count();
+  }
+
+  public void close() throws SQLException {
+    log.debug(
+        "Closing BufferedRecords with updatePreparedStatement: {} deletePreparedStatement: {}",
+        updatePreparedStatement,
+        deletePreparedStatement
+    );
+    if (nonNull(updatePreparedStatement)) {
+      updatePreparedStatement.close();
+      updatePreparedStatement = null;
+    }
+    if (nonNull(deletePreparedStatement)) {
+      deletePreparedStatement.close();
+      deletePreparedStatement = null;
     }
   }
 
-  @Override
-  public void listFeatureTables(
-      ListFeatureTablesRequest request,
-      StreamObserver<ListFeatureTablesResponse> responseObserver) {
-    try {
-      ListFeatureTablesResponse response = specService.listFeatureTables(request.getFilter());
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (IllegalArgumentException e) {
-      log.error(String.format("ListFeatureTable: Invalid list Feature Table Request"));
-      responseObserver.onError(
-          Status.INVALID_ARGUMENT
-              .withDescription(e.getMessage())
-              .withCause(e)
-              .asRuntimeException());
-    } catch (Exception e) {
-      log.error("ListFeatureTable: Exception has occurred: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
+  private String getInsertSql() throws SQLException {
+    switch (config.insertMode) {
+      case INSERT:
+        return dbDialect.buildInsertStatement(
+            tableId,
+            asColumns(fieldsMetadata.keyFieldNames),
+            asColumns(fieldsMetadata.nonKeyFieldNames),
+            dbStructure.tableDefinition(connection, tableId)
+        );
+      case UPSERT:
+        if (fieldsMetadata.keyFieldNames.isEmpty()) {
+          throw new ConnectException(String.format(
+              "Write to table '%s' in UPSERT mode requires key field names to be known, check the"
+                  + " primary key configuration",
+              tableId
+          ));
+        }
+        try {
+          return dbDialect.buildUpsertQueryStatement(
+              tableId,
+              asColumns(fieldsMetadata.keyFieldNames),
+              asColumns(fieldsMetadata.nonKeyFieldNames),
+              dbStructure.tableDefinition(connection, tableId)
+          );
+        } catch (UnsupportedOperationException e) {
+          throw new ConnectException(String.format(
+              "Write to table '%s' in UPSERT mode is not supported with the %s dialect.",
+              tableId,
+              dbDialect.name()
+          ));
+        }
+      case UPDATE:
+        return dbDialect.buildUpdateStatement(
+            tableId,
+            asColumns(fieldsMetadata.keyFieldNames),
+            asColumns(fieldsMetadata.nonKeyFieldNames),
+            dbStructure.tableDefinition(connection, tableId)
+        );
+      default:
+        throw new ConnectException("Invalid insert mode");
     }
   }
 
-  @Override
-  public void getFeatureTable(
-      GetFeatureTableRequest request, StreamObserver<GetFeatureTableResponse> responseObserver) {
-    try {
-      GetFeatureTableResponse response = specService.getFeatureTable(request);
+  private String getDeleteSql() {
+    String sql = null;
+    if (config.deleteEnabled) {
+      switch (config.pkMode) {
+        case RECORD_KEY:
+          if (fieldsMetadata.keyFieldNames.isEmpty()) {
+            throw new ConnectException("Require primary keys to support delete");
+          }
+          try {
+            sql = dbDialect.buildDeleteStatement(
+                tableId,
+                asColumns(fieldsMetadata.keyFieldNames)
+            );
+          } catch (UnsupportedOperationException e) {
+            throw new ConnectException(String.format(
+                "Deletes to table '%s' are not supported with the %s dialect.",
+                tableId,
+                dbDialect.name()
+            ));
+          }
+          break;
 
-      responseObserver.onNext(response);
-      responseObserver.onCompleted();
-    } catch (NoSuchElementException e) {
-      log.error(
-          String.format(
-              "GetFeatureTable: No such Feature Table: (project: %s, name: %s)",
-              request.getProject(), request.getName()));
-      responseObserver.onError(
-          Status.NOT_FOUND.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (Exception e) {
-      log.error("GetFeatureTable: Exception has occurred: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
+        default:
+          throw new ConnectException("Deletes are only supported for pk.mode record_key");
+      }
     }
+    return sql;
   }
 
-  @Override
-  public void deleteFeatureTable(
-      DeleteFeatureTableRequest request,
-      StreamObserver<DeleteFeatureTableResponse> responseObserver) {
-    String projectName = request.getProject();
-    try {
-      // Check if user has authorization to delete feature table
-      authorizationService.authorizeRequest(SecurityContextHolder.getContext(), projectName);
-      specService.deleteFeatureTable(request);
-
-      responseObserver.onNext(DeleteFeatureTableResponse.getDefaultInstance());
-      responseObserver.onCompleted();
-    } catch (NoSuchElementException e) {
-      log.error(
-          String.format(
-              "DeleteFeatureTable: No such Feature Table: (project: %s, name: %s)",
-              request.getProject(), request.getName()));
-      responseObserver.onError(
-          Status.NOT_FOUND.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    } catch (Exception e) {
-      log.error("DeleteFeatureTable: Exception has occurred: ", e);
-      responseObserver.onError(
-          Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
-    }
+  private Collection<ColumnId> asColumns(Collection<String> names) {
+    return names.stream()
+        .map(name -> new ColumnId(tableId, name))
+        .collect(Collectors.toList());
   }
 }
